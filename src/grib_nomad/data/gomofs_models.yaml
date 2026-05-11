@@ -1,0 +1,52 @@
+# NOAA Gulf of Maine Operational Forecast System (GoMOFS) — sourced from the
+# AWS Open Data S3 mirror `noaa-ofs-pds` (us-east-1, no auth, last 30 days).
+#
+# GoMOFS is a ROMS model on a structured curvilinear grid (777 x 1173 cells,
+# Arakawa C-grid). The 2ds product has hourly surface fields out to f072.
+# Surface u/v are on staggered U-/V-grids with their own 2D lat/lon arrays.
+#
+# Our `gomofs` source downloads each per-fhour 2ds NetCDF into the user cache,
+# builds a one-time cKDTree from each component's native staggered lat/lon to
+# the target regular lat/lon grid, and reuses the lookup tables for every
+# forecast hour of the cycle. The first cycle download is bandwidth-heavy
+# (~170 MB per fhour) — subsequent runs of the same cycle hit cache and are
+# essentially instant.
+
+models:
+
+  - id: gomofs_currents
+    display_name: "GoMOFS surface currents (Gulf of Maine, hourly, with tides)"
+    source: gomofs
+    cycles: [0, 6, 12, 18]
+    max_fhour: 72
+    latency_hours: 4
+    steps:
+      - { from: 1, to: 72, step: 1 }
+    extra:
+      # AWS S3 layout: noaa-ofs-pds/gomofs.YYYYMMDD/gomofs.tHHz.YYYYMMDD.2ds.fHHH.nc
+      s3_base_url: https://noaa-ofs-pds.s3.amazonaws.com
+      ofs_id: gomofs
+      file_template: "{ofs_id}.{date}/{ofs_id}.t{cycle:02d}z.{date}.2ds.f{fhour:03d}.nc"
+      target_lat_step_deg: 0.01
+      target_lon_step_deg: 0.01
+      # The land/water decision per output cell is now made by the GSHHG
+      # full-resolution coastline lookup (`core/coastline.py`); this
+      # parameter is just a sanity threshold on distance from the nearest
+      # GoMOFS water rho cell — generous 0.5° excludes only targets that
+      # are clearly outside the GoMOFS domain.
+      max_dist_to_gomofs_water_deg: 0.5
+      # GoMOFS native domain
+      domain_lat_min: 39.0
+      domain_lat_max: 46.0
+      domain_lon_min: -72.0
+      domain_lon_max: -64.0
+      # ROMS variable naming on the 2ds product. u_sur/v_sur are along the
+      # model's xi/eta directions (NOT east/north) on staggered u-/v-points;
+      # the source destaggers to rho-points and rotates by `angle` before
+      # writing UOGRD/VOGRD.
+      u_var: u_sur
+      v_var: v_sur
+    categories:
+      current:
+        vars: [UOGRD, VOGRD]
+        levels: [surface]

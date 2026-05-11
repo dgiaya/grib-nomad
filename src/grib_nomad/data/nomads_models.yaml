@@ -1,0 +1,263 @@
+# grib_nomad model registry — NOAA NOMADS grib_filter products.
+#
+# This is a hand-curated, routing-relevant subset. To add a model, follow the
+# pattern below and reference the model's grib_filter page on
+# https://nomads.ncep.noaa.gov for the correct filter_path / dir_template /
+# file_template / variable & level names.
+#
+# `steps` is a piecewise list of (from, to, step) rules in forecast hours,
+# inclusive on both ends. The union across rules is the model's native hour set.
+
+models:
+
+  # ---------------------------------------------------------------------------
+  - id: gfs_0p25
+    display_name: "GFS 0.25°"
+    source: nomads
+    cycles: [0, 6, 12, 18]
+    max_fhour: 384
+    latency_hours: 4
+    steps:
+      - { from: 0,   to: 120, step: 1 }
+      - { from: 123, to: 384, step: 3 }
+    extra:
+      filter_path: /cgi-bin/filter_gfs_0p25.pl
+      dir_template: "/gfs.{date}/{cycle:02d}/atmos"
+      file_template: "gfs.t{cycle:02d}z.pgrb2.0p25.f{fhour:03d}"
+    categories:
+      # The `wind` category is a routing-prep bundle: the U/V wind vector
+      # at 10 m, plus the surface-condition fields a router typically wants
+      # alongside it (gust for safety margin, precip rate, total cloud).
+      # grib_filter silently drops (var, level) combos the file doesn't
+      # contain, so listing extra variables/levels is safe.
+      wind:
+        vars: [UGRD, VGRD, GUST, PRATE, TCDC]
+        levels: ["10_m_above_ground", "surface", "entire_atmosphere"]
+      gust:
+        vars: [GUST]
+        levels: [surface]
+      pressure:
+        vars: [PRMSL]
+        levels: [mean_sea_level]
+      temp_2m:
+        vars: [TMP]
+        levels: ["2_m_above_ground"]
+      precip_rate:
+        vars: [PRATE]
+        levels: [surface]
+      cloud:
+        vars: [TCDC]
+        levels: ["entire_atmosphere"]
+
+  # ---------------------------------------------------------------------------
+  - id: gfs_wave_atlantic_0p16
+    display_name: "GFS Wave (Atlantic regional, 0.16°)"
+    source: nomads
+    cycles: [0, 6, 12, 18]
+    max_fhour: 384
+    latency_hours: 5
+    steps:
+      - { from: 0,   to: 120, step: 1 }
+      - { from: 123, to: 384, step: 3 }
+    extra:
+      filter_path: /cgi-bin/filter_gfswave.pl
+      dir_template: "/gfs.{date}/{cycle:02d}/wave/gridded"
+      file_template: "gfswave.t{cycle:02d}z.atlocn.0p16.f{fhour:03d}.grib2"
+    categories:
+      # `wave` = routing-prep bundle: combined-wave height/period/direction
+      # plus the wind-wave-only components (separates locally-generated seas
+      # from swell, which matters for sailboat motion). Standalone
+      # wind_wave/swell/sea_wind categories below stay available for
+      # explicit-pull recipes.
+      wave:
+        vars: [HTSGW, PERPW, DIRPW, WVHGT, WVPER, WVDIR]
+        levels: [surface]
+      wind_wave:
+        vars: [WVHGT, WVPER, WVDIR]
+        levels: [surface]
+      swell:
+        # GFS Wave decomposes swell into three sequential components
+        # (primary/secondary/tertiary swell systems). They live at the
+        # `N in sequence` levels rather than `surface` — getting the
+        # level wrong silently returns an empty 200 OK from grib_filter.
+        vars: [SWELL, SWPER, SWDIR]
+        levels: ["1_in_sequence", "2_in_sequence", "3_in_sequence"]
+      sea_wind:
+        vars: [WIND, WDIR]
+        levels: [surface]
+
+  # ---------------------------------------------------------------------------
+  - id: gfs_wave_global_0p25
+    display_name: "GFS Wave (global 0.25°)"
+    source: nomads
+    cycles: [0, 6, 12, 18]
+    max_fhour: 384
+    latency_hours: 5
+    steps:
+      - { from: 0,   to: 120, step: 1 }
+      - { from: 123, to: 384, step: 3 }
+    extra:
+      filter_path: /cgi-bin/filter_gfswave.pl
+      dir_template: "/gfs.{date}/{cycle:02d}/wave/gridded"
+      file_template: "gfswave.t{cycle:02d}z.global.0p25.f{fhour:03d}.grib2"
+    categories:
+      wave:
+        # Significant height of combined wind waves and swell + primary period/direction
+        vars: [HTSGW, PERPW, DIRPW]
+        levels: [surface]
+      wind_wave:
+        vars: [WVHGT, WVPER, WVDIR]
+        levels: [surface]
+      swell:
+        # See comment on gfs_wave_atlantic_0p16 — swell components live
+        # at `N in sequence` levels, not `surface`.
+        vars: [SWELL, SWPER, SWDIR]
+        levels: ["1_in_sequence", "2_in_sequence", "3_in_sequence"]
+      sea_wind:
+        vars: [WIND, WDIR]
+        levels: [surface]
+
+  # ---------------------------------------------------------------------------
+  # HRRR is split into two registry entries so a recipe can use them as
+  # sequential tiers: `_hourly` for the freshest near-term forecast (~0–18h)
+  # then `_sfc` (extended cycle) for f18–f48. NOAA's HRRR has a quirk —
+  # every cycle runs to f18, but ONLY the 00/06/12/18 cycles also run to
+  # f48. Mixing them lets us get freshness AND reach in one wind tier
+  # ladder.
+
+  - id: hrrr_conus_hourly
+    display_name: "HRRR CONUS hourly (surface, 3 km, latest cycle, max f18)"
+    source: nomads
+    # Every hour. Use the latest available for freshest forecast data.
+    cycles: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23]
+    max_fhour: 18
+    latency_hours: 2
+    steps:
+      - { from: 0, to: 18, step: 1 }
+    extra:
+      filter_path: /cgi-bin/filter_hrrr_2d.pl
+      dir_template: "/hrrr.{date}/conus"
+      file_template: "hrrr.t{cycle:02d}z.wrfsfcf{fhour:02d}.grib2"
+    categories:
+      wind:
+        vars: [UGRD, VGRD, GUST, PRATE, TCDC]
+        levels: ["10_m_above_ground", "surface", "entire_atmosphere"]
+      gust:
+        vars: [GUST]
+        levels: [surface]
+      pressure:
+        vars: [MSLMA]
+        levels: [mean_sea_level]
+      temp_2m:
+        vars: [TMP]
+        levels: ["2_m_above_ground"]
+      precip_rate:
+        vars: [PRATE]
+        levels: [surface]
+      reflectivity:
+        vars: [REFC]
+        levels: ["entire_atmosphere"]
+
+  - id: hrrr_conus_sfc
+    display_name: "HRRR CONUS extended (surface, 3 km, 00/06/12/18 cycles, max f48)"
+    source: nomads
+    # Only the extended cycles run to f48; pinning here so tier resolution
+    # can't pick a 13z cycle and then 404 trying to fetch f019. Use this
+    # tier AFTER `hrrr_conus_hourly` to fill the f18→f48 gap with the
+    # freshest extended cycle available.
+    cycles: [0, 6, 12, 18]
+    max_fhour: 48
+    # Extended cycles take longer to publish than hourly ones (more
+    # forecast hours to compute). 3h latency is the empirically-safe value
+    # for the f48-extended outputs.
+    latency_hours: 3
+    steps:
+      - { from: 0, to: 48, step: 1 }
+    extra:
+      filter_path: /cgi-bin/filter_hrrr_2d.pl
+      dir_template: "/hrrr.{date}/conus"
+      file_template: "hrrr.t{cycle:02d}z.wrfsfcf{fhour:02d}.grib2"
+    categories:
+      # `wind` = routing-prep bundle: 10 m wind vector + gust + precip rate
+      # + total cloud. grib_filter drops (var, level) pairs that don't exist
+      # in the file, so listing extra entries is safe; we deliberately list
+      # the surface/entire-atmosphere levels so GUST/PRATE/TCDC come along.
+      wind:
+        vars: [UGRD, VGRD, GUST, PRATE, TCDC]
+        levels: ["10_m_above_ground", "surface", "entire_atmosphere"]
+      gust:
+        vars: [GUST]
+        levels: [surface]
+      pressure:
+        vars: [MSLMA]
+        levels: [mean_sea_level]
+      temp_2m:
+        vars: [TMP]
+        levels: ["2_m_above_ground"]
+      precip_rate:
+        vars: [PRATE]
+        levels: [surface]
+      reflectivity:
+        vars: [REFC]
+        levels: ["entire_atmosphere"]
+
+  # ---------------------------------------------------------------------------
+  - id: nam_conusnest
+    display_name: "NAM CONUS Nest (3 km)"
+    source: nomads
+    cycles: [0, 6, 12, 18]
+    max_fhour: 60
+    latency_hours: 3
+    steps:
+      - { from: 0, to: 60, step: 1 }
+    extra:
+      filter_path: /cgi-bin/filter_nam_conusnest.pl
+      dir_template: "/nam.{date}"
+      file_template: "nam.t{cycle:02d}z.conusnest.hiresf{fhour:02d}.tm00.grib2"
+    categories:
+      wind:
+        vars: [UGRD, VGRD, GUST, PRATE, TCDC]
+        levels: ["10_m_above_ground", "surface", "entire_atmosphere"]
+      gust:
+        vars: [GUST]
+        levels: [surface]
+      pressure:
+        vars: [PRMSL]
+        levels: [mean_sea_level]
+      temp_2m:
+        vars: [TMP]
+        levels: ["2_m_above_ground"]
+      precip_rate:
+        vars: [PRATE]
+        levels: [surface]
+
+  # ---------------------------------------------------------------------------
+  - id: nam_12km
+    display_name: "NAM 12 km"
+    source: nomads
+    cycles: [0, 6, 12, 18]
+    max_fhour: 84
+    latency_hours: 3
+    steps:
+      - { from: 0,  to: 36, step: 1 }
+      - { from: 39, to: 84, step: 3 }
+    extra:
+      filter_path: /cgi-bin/filter_nam.pl
+      dir_template: "/nam.{date}"
+      file_template: "nam.t{cycle:02d}z.awphys{fhour:02d}.tm00.grib2"
+    categories:
+      wind:
+        vars: [UGRD, VGRD, GUST, PRATE, TCDC]
+        levels: ["10_m_above_ground", "surface", "entire_atmosphere"]
+      gust:
+        vars: [GUST]
+        levels: [surface]
+      pressure:
+        vars: [PRMSL]
+        levels: [mean_sea_level]
+      temp_2m:
+        vars: [TMP]
+        levels: ["2_m_above_ground"]
+      precip_rate:
+        vars: [PRATE]
+        levels: [surface]

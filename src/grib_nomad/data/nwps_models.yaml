@@ -1,0 +1,89 @@
+# grib_nomad NWPS (Nearshore Wave Prediction System) registry.
+#
+# NWPS is NOAA's coastal-resolution wave model — SWAN driven by GFS Wave at
+# the open boundary, run separately by each Eastern-Region (and other-region)
+# coastal Weather Forecast Office (WFO). Grid resolutions are typically
+# 1–3 km, much finer than GFS Wave's 0.16° (~17 km), so it actually resolves
+# Vineyard/Nantucket Sound, Chesapeake Bay, Long Island Sound, etc. — places
+# where GFS Wave masks out everything as land.
+#
+# NOMADS layout differs from the other models:
+#   - One GRIB2 file per (WFO, cycle, computational grid) — NOT per-fhour.
+#     e.g. /pub/data/nccf/com/nwps/prod/er.YYYYMMDD/box/HH/CG1/
+#          box_nwps_CG1_YYYYMMDD_HH00.grib2  (~44 MB before filtering)
+#   - The single file contains every forecast hour for that cycle.
+#
+# The `nwps` source handles this by downloading the per-cycle bundle once
+# (via grib_filter for variable/level/bbox subsetting), then splitting it
+# into per-fhour cache files locally so the rest of the pipeline (combiner,
+# manifest) sees the same per-fhour parts as it does from other sources.
+#
+# To add another WFO: copy the BOX entry, swap `wfo: box` → `wfo: <code>`,
+# update the model id, display name, and `domain_lat/lon_*` rough bounds.
+# The grib_filter path stays `/cgi-bin/filter_ernwps.pl` for any Eastern-
+# Region WFO. (For Southern Region use `filter_srnwps.pl`, etc.)
+
+models:
+
+  - id: nwps_box_cg1
+    display_name: "NWPS BOX CG1 (Boston/Norton WFO coastal wave, ~1.5 km)"
+    source: nwps
+    # NWPS BOX runs only twice daily, NOT 4×. Empirically (May 2026):
+    #   00z cycle dir modified ~06:32Z (publication complete by ~07:30Z)
+    #   12z cycle dir modified ~18:30Z (publication complete by ~19:30Z)
+    # If we list 06/18 here, the cycle picker happily chooses them and we
+    # 404 against a directory that never existed.
+    cycles: [0, 12]
+    # NWPS forecast horizon is 144h at most WFOs. If the actual published
+    # file is shorter on a given cycle, the source-side splitter only emits
+    # the fhours it actually finds.
+    max_fhour: 144
+    # NWPS publishes ~6.5h after the cycle hour (it has to wait for GFS Wave
+    # boundary forcing, then SWAN run, then upload). 8h gives us a safety
+    # margin so the picker never selects a cycle that's still uploading.
+    latency_hours: 8
+    steps:
+      - { from: 0, to: 144, step: 1 }
+    extra:
+      # NOMADS grib_filter endpoint (Eastern Region). Same endpoint for every
+      # ER WFO; the `dir` query selects the WFO subdir.
+      filter_path: /cgi-bin/filter_ernwps.pl
+      # Directory + filename templates use the WFO code in the path/name.
+      dir_template: "/er.{date}/{wfo}/{cycle:02d}/CG1"
+      file_template: "{wfo}_nwps_CG1_{date}_{cycle:02d}00.grib2"
+      wfo: box
+      # Approx coverage of the BOX CG1 domain. Used only by the bbox-vs-
+      # domain sanity check at request time; the actual grid is read from
+      # the GRIB itself.
+      domain_lat_min: 40.5
+      domain_lat_max: 43.0
+      domain_lon_min: -71.5
+      domain_lon_max: -69.0
+    # IMPORTANT: NWPS variable set is NOT the same as GFS Wave. SWAN (the
+    # underlying physics engine) reports the combined sea state and the swell
+    # components, but does NOT publish a separable wind-wave (sea) field on
+    # NOMADS. The available vars are:
+    #   DIRC DIRPW DSLM EROSNP HTSGW OWASHP PERPW RIPCOP SPC SWDIR SWELL
+    #   SWPER WDIR WIND
+    # So:
+    #   - `wave` covers combined + primary period/direction only.
+    #   - `swell` covers the swell components (single, not 3-in-sequence
+    #     like GFS Wave).
+    #   - `wind_wave` is intentionally absent — requesting WVHGT/WVPER/WVDIR
+    #     here produced a 500 from grib_filter because none of those names
+    #     exist in the file. Users who need the wind-wave decomposition
+    #     should keep the `wind_wave` tier on `gfs_wave_atlantic_0p16` even
+    #     when the rest of `wave / swell` moves to NWPS.
+    categories:
+      wave:
+        # Combined-sea height + primary mean period + primary direction.
+        vars: [HTSGW, PERPW, DIRPW]
+        levels: [surface]
+      swell:
+        # Single swell component, surface level — NOT the `N in sequence`
+        # decomposition GFS Wave uses.
+        vars: [SWELL, SWPER, SWDIR]
+        levels: [surface]
+      sea_wind:
+        vars: [WIND, WDIR]
+        levels: [surface]

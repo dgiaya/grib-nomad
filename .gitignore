@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+env/
+
+# Test / coverage
+.pytest_cache/
+.coverage
+htmlcov/
+.ruff_cache/
+.mypy_cache/
+
+# Editor
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# Project: downloaded GRIB output and scratch
+downloads/
+*.grb2
+*.grib2
+*.grib
+!tests/fixtures/**/*.grb2
+!tests/fixtures/**/*.grib2
