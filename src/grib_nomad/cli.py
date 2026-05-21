@@ -47,7 +47,12 @@ from grib_nomad.sources.nwps import NwpsSource
 console = Console()
 
 
-def _build_sources(workers: int) -> dict:
+def _build_sources(
+    workers: int,
+    *,
+    nomads_rate_per_min: float | None = None,
+    nomads_concurrency: int | None = None,
+) -> dict:
     # NOMADS and GoMOFS have very different concurrency budgets:
     #   - NOMADS sits behind Akamai with a documented ~120 hits/min cap, and
     #     NomadsSource enforces this internally with a token bucket + a
@@ -58,6 +63,11 @@ def _build_sources(workers: int) -> dict:
     #     gigabit link. We don't want a low `--workers` (set for NOMADS
     #     politeness) to needlessly slow the S3 path.
     # So we floor GoMOFS at 16 and let users scale further via --workers.
+    if nomads_rate_per_min is not None or nomads_concurrency is not None:
+        NomadsSource.configure_rate(
+            rate_per_min=nomads_rate_per_min,
+            concurrency=nomads_concurrency,
+        )
     return {
         "nomads": NomadsSource(max_workers=workers),
         "ecmwf_open": EcmwfOpenSource(),
@@ -269,6 +279,16 @@ def _parse_tier_spec(spec: str) -> tuple[str, ModelTier]:
     type=click.IntRange(min=1, max=64),
     help="Concurrent fetches for NOMADS (token-bucket-throttled internally regardless). GoMOFS has its own higher floor (S3 doesn't need throttling). 8 is a sensible default.",
 )
+@click.option(
+    "--nomads-rate-per-min",
+    type=click.FloatRange(min=1, max=120),
+    help="Override NOMADS request rate (default: 100/min). Lower this if you're hitting Akamai 'Over Rate Limit' 302s — try 60 or 40 if a shared IP (CGNAT, VPN, office NAT) is suspected.",
+)
+@click.option(
+    "--nomads-concurrency",
+    type=click.IntRange(min=1, max=16),
+    help="Override NOMADS concurrent-request cap (default: 4). Drop to 2 alongside a lower --nomads-rate-per-min for the most conservative profile.",
+)
 def download(
     region_name: str | None,
     bbox_str: str | None,
@@ -279,6 +299,8 @@ def download(
     name: str,
     save_as: str | None,
     workers: int,
+    nomads_rate_per_min: float | None,
+    nomads_concurrency: int | None,
 ) -> None:
     """Run a one-shot recipe from CLI flags."""
     if not (region_name or bbox_str):
@@ -311,7 +333,13 @@ def download(
         _save_recipe(recipe, name=save_as)
         console.print(f"[green]saved recipe[/] {save_as}")
 
-    _execute(recipe, Path(out_dir), workers=workers)
+    _execute(
+        recipe,
+        Path(out_dir),
+        workers=workers,
+        nomads_rate_per_min=nomads_rate_per_min,
+        nomads_concurrency=nomads_concurrency,
+    )
 
 
 @main.group()
@@ -380,12 +408,24 @@ def recipe_delete(name: str) -> None:
     show_default=True,
     type=click.IntRange(min=1, max=64),
 )
+@click.option(
+    "--nomads-rate-per-min",
+    type=click.FloatRange(min=1, max=120),
+    help="Override NOMADS request rate (default: 100/min). Lower this if you're hitting Akamai 'Over Rate Limit' 302s — try 60 or 40 if a shared IP (CGNAT, VPN, office NAT) is suspected.",
+)
+@click.option(
+    "--nomads-concurrency",
+    type=click.IntRange(min=1, max=16),
+    help="Override NOMADS concurrent-request cap (default: 4). Drop to 2 alongside a lower --nomads-rate-per-min for the most conservative profile.",
+)
 def recipe_run(
     name: str,
     out_dir: str,
     start: str | None,
     duration: str | None,
     workers: int,
+    nomads_rate_per_min: float | None,
+    nomads_concurrency: int | None,
 ) -> None:
     data = load_yaml(recipes_path())
     if name not in data:
@@ -395,7 +435,13 @@ def recipe_run(
         r.start = _parse_start(start)
     if duration is not None:
         r.duration_hours = _parse_duration(duration)
-    _execute(r, Path(out_dir), workers=workers)
+    _execute(
+        r,
+        Path(out_dir),
+        workers=workers,
+        nomads_rate_per_min=nomads_rate_per_min,
+        nomads_concurrency=nomads_concurrency,
+    )
 
 
 # --- helpers ----------------------------------------------------------------
@@ -408,9 +454,20 @@ def _save_recipe(recipe: Recipe, *, name: str) -> None:
     save_yaml(recipes_path(), data)
 
 
-def _execute(recipe: Recipe, out_dir: Path, *, workers: int = 6) -> None:
+def _execute(
+    recipe: Recipe,
+    out_dir: Path,
+    *,
+    workers: int = 6,
+    nomads_rate_per_min: float | None = None,
+    nomads_concurrency: int | None = None,
+) -> None:
     registry = load_registry()
-    sources = _build_sources(workers)
+    sources = _build_sources(
+        workers,
+        nomads_rate_per_min=nomads_rate_per_min,
+        nomads_concurrency=nomads_concurrency,
+    )
     try:
         result = run_recipe(
             recipe,

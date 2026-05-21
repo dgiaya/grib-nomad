@@ -25,6 +25,7 @@ GoMOFS recipes share a process.
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import pickle
 import threading
@@ -45,6 +46,9 @@ GSHHG_L1_RELPATH = "GSHHS_shp/f/GSHHS_f_L1.shp"
 
 # Bump when the on-disk pickle structure changes so old pickles get rebuilt.
 _PICKLE_FORMAT_VERSION = 1
+# Bump when the per-grid mask cache format changes so old masks get rebuilt
+# independently of the polygon pickle.
+_MASK_FORMAT_VERSION = 1
 
 _LOAD_LOCK = threading.Lock()
 
@@ -93,6 +97,47 @@ def _pickle_path(shp_path: Path) -> Path:
     return shp_path.with_name(
         f"{shp_path.stem}.fmt{_PICKLE_FORMAT_VERSION}.shapely{safe_ver}.pkl"
     )
+
+
+def _mask_cache_path(target_lat, target_lon) -> Path:
+    """Per-grid mask cache path, keyed on the exact bytes of the target
+    grid arrays plus the GSHHG dataset version. Any run that produces an
+    identical (target_lat, target_lon) — i.e. same bbox + same step —
+    reuses the cached boolean mask. Stored as plain .npy alongside the
+    GSHHG shapefile so `rm -rf` of the cache dir cleans both."""
+    h = hashlib.sha1()
+    # `tobytes()` includes dtype/shape implicitly via the buffer length;
+    # casting to float64 first means a 0.01° lat array from a 32-bit
+    # bbox calculation hashes the same as one from 64-bit.
+    h.update(target_lat.astype("float64").tobytes())
+    h.update(b"|")
+    h.update(target_lon.astype("float64").tobytes())
+    digest = h.hexdigest()[:16]
+    return (
+        gshhg_root()
+        / f"mask.gshhg{GSHHG_VERSION}.fmt{_MASK_FORMAT_VERSION}.{digest}.npy"
+    )
+
+
+def _save_mask_cache(cache_path: Path, mask, np) -> None:
+    """Best-effort atomic write of the per-grid mask. Failures are logged
+    and swallowed — the caller has the in-memory mask either way; a cache
+    miss next run is fine.
+
+    Note: `np.save` auto-appends `.npy` to a string/Path path if it
+    doesn't already end in `.npy`, which would silently break the
+    `.part` → final rename. Passing an open file handle bypasses that
+    extension fixup so the bytes land exactly where we expect.
+    """
+    try:
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = cache_path.with_suffix(cache_path.suffix + ".part")
+        with tmp.open("wb") as f:
+            np.save(f, mask)
+        tmp.replace(cache_path)
+        log.info("Wrote GSHHG mask cache %s", cache_path.name)
+    except Exception as e:
+        log.warning("Failed to cache GSHHG mask (%s)", e)
 
 
 class CoastlineLookup:
@@ -176,59 +221,87 @@ class CoastlineLookup:
             return cls._singleton
 
     def has_water_grid(self, target_lat, target_lon, np):
-        """For each output cell, return True if any of the cell rectangle is over water.
+        """For each output cell, return True if its centroid is over water.
 
-        A cell is "fully on land" iff some single GSHHG L1 polygon
-        contains its entire bounding rectangle; otherwise it's marked as
-        having water (so a coastal cell that's mostly Cape Cod but has a
-        sliver of Buzzards Bay still counts as water and gets a current
-        value from the nearest GoMOFS rho cell).
+        Semantic note: this is point-in-polygon on the cell centroid, not
+        rectangle-in-polygon over the full cell box. At GoMOFS-native
+        target steps (~0.01° ≈ 1 km) vs GSHHG full-resolution coastlines
+        (~100 m), the difference is at most a one-cell border effect
+        along shorelines — handled downstream by the nearest-GoMOFS-water
+        fill. The earlier rectangle-contains semantic was orders of
+        magnitude slower (each predicate eval ran full geometric
+        containment against coast polygons with millions of vertices);
+        point-in-polygon uses prepared-geometry ray casting in O(log V)
+        per point and is genuinely vectorized through GEOS.
+
+        Cached on disk per (target grid bytes, GSHHG version) so any
+        rerun with the same grid is an instant numpy load.
         """
-        import shapely.geometry as sg
+        import shapely
 
         nlat = len(target_lat)
         nlon = len(target_lon)
-        # Cell side lengths (assume regular spacing)
-        dlat = float(target_lat[1] - target_lat[0]) if nlat > 1 else 0.01
-        dlon = float(target_lon[1] - target_lon[0]) if nlon > 1 else 0.01
 
-        # Build a quick coarse-cull bbox over the whole target grid so we don't
-        # iterate every continent on the planet for each cell.
-        grid_box = sg.box(
-            float(target_lon.min()) - dlon,
-            float(target_lat.min()) - dlat,
-            float(target_lon.max()) + dlon,
-            float(target_lat.max()) + dlat,
+        cache_path = _mask_cache_path(target_lat, target_lon)
+        if cache_path.exists():
+            try:
+                t0 = time.time()
+                mask = np.load(cache_path)
+                if mask.shape == (nlat, nlon) and mask.dtype == np.bool_:
+                    log.info(
+                        "GSHHG mask loaded from cache: %dx%d in %.2fs (%s)",
+                        nlat, nlon, time.time() - t0, cache_path.name,
+                    )
+                    return mask
+                log.warning(
+                    "GSHHG mask cache shape/dtype mismatch (got %s %s, expected (%d,%d) bool); rebuilding",
+                    mask.shape, mask.dtype, nlat, nlon,
+                )
+            except Exception as e:
+                log.warning("GSHHG mask cache load failed (%s); rebuilding", e)
+
+        # Cell centroids as flat lon/lat arrays. `shapely.contains_xy`
+        # consumes raw arrays — no need to construct shapely Point objects.
+        t0 = time.time()
+        lon_grid, lat_grid = np.meshgrid(target_lon, target_lat)
+        lon_flat = lon_grid.ravel()
+        lat_flat = lat_grid.ravel()
+
+        # Bbox-prune candidate land polygons via the prebuilt class-level
+        # STRtree. This is the only step that touches all 188K GSHHG
+        # polygons; for typical regional bboxes it shrinks the working
+        # set to a few thousand at most.
+        grid_box = shapely.box(
+            float(lon_flat.min()), float(lat_flat.min()),
+            float(lon_flat.max()), float(lat_flat.max()),
         )
         candidate_indices = list(self.tree.query(grid_box))
         if not candidate_indices:
-            # No land polygons touch the grid at all: every cell is water.
-            return np.ones((nlat, nlon), dtype=bool)
-        candidate_polys = [self.polygons[i] for i in candidate_indices]
+            # Nothing on this grid touches land — every cell is water.
+            has_water = np.ones((nlat, nlon), dtype=bool)
+            log.info(
+                "GSHHG mask: no candidate land polygons in bbox; all-water mask (%dx%d) in %.2fs",
+                nlat, nlon, time.time() - t0,
+            )
+            _save_mask_cache(cache_path, has_water, np)
+            return has_water
 
-        from shapely.strtree import STRtree as _STRtree
+        # Vectorized point-in-polygon: one C call per candidate polygon,
+        # OR-aggregated. `contains_xy` uses GEOS prepared geometries
+        # internally, so even big polygons (continent boundaries) are
+        # cheap per-point after the first call. Bail out the moment every
+        # cell is already classified as land — common when the bbox sits
+        # mostly inside a continent.
+        on_land = np.zeros(lon_flat.size, dtype=bool)
+        for idx in candidate_indices:
+            if on_land.all():
+                break
+            on_land |= shapely.contains_xy(self.polygons[idx], lon_flat, lat_flat)
 
-        local_tree = _STRtree(candidate_polys)
-
-        has_water = np.ones((nlat, nlon), dtype=bool)
-        for i in range(nlat):
-            lat = float(target_lat[i])
-            for j in range(nlon):
-                lon = float(target_lon[j])
-                cell = sg.box(
-                    lon - dlon / 2,
-                    lat - dlat / 2,
-                    lon + dlon / 2,
-                    lat + dlat / 2,
-                )
-                hits = local_tree.query(cell)
-                if len(hits) == 0:
-                    continue  # no land touches this cell — all water
-                fully_on_land = False
-                for idx in hits:
-                    if candidate_polys[idx].contains(cell):
-                        fully_on_land = True
-                        break
-                if fully_on_land:
-                    has_water[i, j] = False
+        has_water = (~on_land).reshape(nlat, nlon)
+        log.info(
+            "GSHHG mask built: %dx%d cells in %.2fs (%d candidate polygons, %d land cells)",
+            nlat, nlon, time.time() - t0, len(candidate_indices), int(on_land.sum()),
+        )
+        _save_mask_cache(cache_path, has_water, np)
         return has_water

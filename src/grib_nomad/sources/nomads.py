@@ -70,7 +70,10 @@ class _TokenBucket:
 
     def __init__(self, capacity: float, refill_per_sec: float):
         self.capacity = float(capacity)
-        self.tokens = float(capacity)
+        # Start empty, not full: a full bucket at process start lets the
+        # first `capacity` requests fire back-to-back, which trips
+        # Akamai's burst gate well before the steady-state rate matters.
+        self.tokens = 0.0
         self.refill_per_sec = float(refill_per_sec)
         self._last = time.monotonic()
         self._lock = threading.Lock()
@@ -94,15 +97,47 @@ class _TokenBucket:
 class NomadsSource(Source):
     name = "nomads"
 
-    # NOAA's actual rate limit per the LuckGrib reverse-engineering note
+    # NOAA's published guidance per the LuckGrib reverse-engineering note
     # (https://luckgrib.com/blog/2021/04/19/throttling.html) is **120
-    # hits/minute**, not concurrency-based. The token bucket below
-    # enforces ~100/min (with margin) regardless of how many worker
-    # threads are queued. The semaphore is a separate, looser cap that
-    # prevents an unbounded burst of concurrent connections when the
-    # bucket happens to be full from a long idle.
+    # hits/minute**. We default to ~100/min with a small burst margin,
+    # but the real Akamai gate is burst-sensitive: a full bucket at
+    # process start lets `capacity` requests race out the door in <5s,
+    # which trips Akamai well before the steady-state rate ever matters.
+    # _TokenBucket starts empty (see __init__), so even with capacity=100
+    # the first 60s are paced by the refill rate (~1.67/sec).
+    #
+    # Override via NomadsSource.configure_rate(rate_per_min=..., concurrency=...)
+    # at process startup (e.g. from CLI flags) to dial down for shared
+    # egress IPs (CGNAT, office NAT) or to ratchet back up after probing.
     _global_rate_bucket = _TokenBucket(capacity=100.0, refill_per_sec=100.0 / 60.0)
     _global_request_semaphore = threading.Semaphore(4)
+
+    @classmethod
+    def configure_rate(
+        cls,
+        *,
+        rate_per_min: float | None = None,
+        concurrency: int | None = None,
+    ) -> None:
+        """Replace the class-level token bucket and/or concurrency gate.
+
+        Call once at process startup, before constructing any NomadsSource.
+        The new bucket starts empty (same as the default), so the change
+        takes effect from the very first request. In-flight semaphore
+        holders are not re-gated — concurrency changes only apply to
+        slots acquired after this call.
+        """
+        if rate_per_min is not None:
+            if rate_per_min <= 0:
+                raise ValueError("rate_per_min must be > 0")
+            cls._global_rate_bucket = _TokenBucket(
+                capacity=float(rate_per_min),
+                refill_per_sec=float(rate_per_min) / 60.0,
+            )
+        if concurrency is not None:
+            if concurrency < 1:
+                raise ValueError("concurrency must be >= 1")
+            cls._global_request_semaphore = threading.Semaphore(int(concurrency))
 
     # Once Akamai's edge layer has 302'd us with an "Over Rate Limit" page,
     # every subsequent request will get the same response until the IP
